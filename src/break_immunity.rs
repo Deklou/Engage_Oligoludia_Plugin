@@ -1,7 +1,7 @@
 use unity::prelude::*;
 
 // Layouts and offsets from Engage 2.0.0 (main_200), AArch64.
-// The hook leaves all other weapons and all non-immunity checks untouched.
+// The hooks preserve all vanilla behavior except Oligoludia's Break immunity bypass.
 #[unity::class("App", "BattleInfoSide")]
 struct BattleInfoSide {}
 
@@ -9,10 +9,12 @@ struct BattleInfoSide {}
 struct UnitItem {}
 
 const BREAK_IMMUNITY_MASK: i32 = 0x0c00;
-const ALREADY_BROKEN: i32 = 0x4000;
+const BREAK_PROTECTION_STATUS: i32 = 0x4000;
+const BREAK_RESULT: i32 = 0x20;
+const BREAK_ALREADY_APPLIED: i32 = 0x20000000;
 
 pub fn install() {
-    skyline::install_hooks!(can_breakable);
+    skyline::install_hooks!(can_breakable, get_breaked);
 }
 
 #[skyline::hook(offset = 0x01E89B00)]
@@ -65,7 +67,7 @@ unsafe fn oligoludia_can_break_immune_target(side: &BattleInfoSide) -> bool {
     let status_bits = field_i32(status, 0x10);
     let interact = get_interact(current_item, reverse_item, None);
     let can_break = bad_ignore & BREAK_IMMUNITY_MASK != 0
-        && status_bits & ALREADY_BROKEN == 0
+        && status_bits & BREAK_ALREADY_APPLIED == 0
         && interact == 1;
 
     // Diagnostics for this weapon only, capped to avoid flooding Ryujinx.
@@ -84,6 +86,67 @@ unsafe fn oligoludia_can_break_immune_target(side: &BattleInfoSide) -> bool {
         );
     }
     can_break
+}
+
+// A target with BattleInfoSide.Status 0x4000 passes through a second
+// native gate. GetBreaked returns 0x4000 instead of the actual Break result
+// (0x20). CanBreakable alone cannot bypass this protection.
+#[unity::class("App", "BattleCalculator")]
+struct BattleCalculator {}
+
+#[skyline::hook(offset = 0x0246DB90)]
+fn get_breaked(
+    calculator: &BattleCalculator,
+    target: &BattleInfoSide,
+    method: OptionalMethod,
+) -> i32 {
+    let vanilla = call_original!(calculator, target, method);
+    if vanilla != BREAK_PROTECTION_STATUS {
+        return vanilla;
+    }
+
+    unsafe {
+        let target_data = target as *const BattleInfoSide as *const u8;
+        let attacker = field_ptr::<BattleInfoSide>(target_data, 0x78);
+        if attacker.is_null() {
+            return vanilla;
+        }
+
+        let target_skills = field_ptr::<u8>(target_data, 0x88);
+        if target_skills.is_null()
+            || (field_i32(target_skills, 0x3c) & BREAK_IMMUNITY_MASK) == 0
+        {
+            return vanilla;
+        }
+
+        let attacker_data = attacker as *const u8;
+        if field_ptr::<u8>(attacker_data, 0x20).is_null()
+            || field_ptr::<u8>(target_data, 0x20).is_null()
+        {
+            return vanilla;
+        }
+        let attacker_item = battle_side_item(&*attacker, None);
+        let defender_item = battle_side_item(target, None);
+        if attacker_item.is_null()
+            || defender_item.is_null()
+            || !is_oligoludia(attacker_item)
+            || get_interact(attacker_item, defender_item, None) != 1
+        {
+            return vanilla;
+        }
+
+        // Preserve the native stun/already-broken/battle-flag checks:
+        // they were checked by call_original before it returned 0x4000.
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+        if LOG_COUNT.fetch_add(1, Ordering::Relaxed) < 12 {
+            println!(
+                "[oligoludia_plugin] GetBreaked: blocked={:#x} -> break={:#x}",
+                vanilla, BREAK_RESULT
+            );
+        }
+        BREAK_RESULT
+    }
 }
 
 unsafe fn is_oligoludia(unit_item: *const UnitItem) -> bool {
