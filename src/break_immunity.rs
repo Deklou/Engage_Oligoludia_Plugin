@@ -48,29 +48,42 @@ unsafe fn oligoludia_can_break_immune_target(side: &BattleInfoSide) -> bool {
         return false;
     }
 
-    // Index 0 denotes an empty unit-item slot.
-    if field_i32(current_item as *const u8, 0x10) == 0
-        || field_i32(reverse_item as *const u8, 0x10) == 0
-        || !is_oligoludia(current_item)
-    {
+    // No index check here: vanilla checks that UnitItem itself is non-null,
+    // not that the selected item slot has a nonzero index.
+    if !is_oligoludia(current_item) {
         return false;
     }
 
     let mask_skills = field_ptr::<u8>(target, 0x88);
-    if mask_skills.is_null()
-        || (field_i32(mask_skills, 0x3c) & BREAK_IMMUNITY_MASK) == 0
-    {
-        return false;
-    }
-
     let status = field_ptr::<u8>(target, 0x50);
-    if status.is_null() || (field_i32(status, 0x10) & ALREADY_BROKEN) != 0 {
+    if mask_skills.is_null() || status.is_null() {
         return false;
     }
 
-    // Reuse the game's weapon-triangle evaluation, including special item
-    // interactions. 1 means the attacker has advantage.
-    get_interact(current_item, reverse_item, None) == 1
+    let bad_ignore = field_i32(mask_skills, 0x3c);
+    let bad_states = field_i32(mask_skills, 0x38);
+    let status_bits = field_i32(status, 0x10);
+    let interact = get_interact(current_item, reverse_item, None);
+    let can_break = bad_ignore & BREAK_IMMUNITY_MASK != 0
+        && status_bits & ALREADY_BROKEN == 0
+        && interact == 1;
+
+    // Diagnostics for this weapon only, capped to avoid flooding Ryujinx.
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+    if LOG_COUNT.fetch_add(1, Ordering::Relaxed) < 64 {
+        println!(
+            "[oligoludia_plugin] Break check: item_index={} target_index={} bad_ignore={:#x} bad_states={:#x} status={:#x} interact={} override={}",
+            field_i32(current_item as *const u8, 0x10),
+            field_i32(reverse_item as *const u8, 0x10),
+            bad_ignore,
+            bad_states,
+            status_bits,
+            interact,
+            can_break
+        );
+    }
+    can_break
 }
 
 unsafe fn is_oligoludia(unit_item: *const UnitItem) -> bool {
